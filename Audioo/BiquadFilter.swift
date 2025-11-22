@@ -21,10 +21,10 @@ class BiquadFilter {
     private var y2: Float = 0.0
     
     func setPeakingEQ(frequency: Float, sampleRate: Float, q: Float, gainDB: Float) {
-        // Clamp parameters to safe ranges
+        // Clamp parameters to safe ranges with more conservative limits
         let freq = max(20, min(frequency, sampleRate / 2.5))
-        let qVal = max(0.1, min(q, 10.0))
-        let gain = max(-24, min(gainDB, 24))
+        let qVal = max(0.5, min(q, 3.0))  // Reduced max Q for stability
+        let gain = max(-18, min(gainDB, 18))  // Reduced gain range
         
         let omega = 2.0 * Float.pi * freq / sampleRate
         let sinOmega = sin(omega)
@@ -61,18 +61,27 @@ class BiquadFilter {
         // Check for invalid input
         guard input.isFinite else { return 0 }
         
-        let output = b0 * input + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2
+        // Denormal protection: treat very small values as zero
+        let cleanInput = abs(input) < 1e-10 ? 0 : input
         
-        // Update state variables
+        let output = b0 * cleanInput + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2
+        
+        // Update state variables with denormal protection
         x2 = x1
-        x1 = input
+        x1 = cleanInput
         y2 = y1
-        y1 = output
+        y1 = abs(output) < 1e-10 ? 0 : output
         
         // Check for NaN or infinity and reset if needed
         if !output.isFinite {
             reset()
-            return input
+            return cleanInput
+        }
+        
+        // Additional stability check: if output is too large, reset
+        if abs(output) > 100.0 {
+            reset()
+            return cleanInput
         }
         
         return output

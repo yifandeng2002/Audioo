@@ -17,11 +17,50 @@ class VideoProcessor: ObservableObject {
     @Published var isPlaying = false
     @Published var equalizerBands: [EqualizerBand] = [
         EqualizerBand(frequency: 60, gain: 0, bandwidth: 1.0, name: "Bass"),
-        EqualizerBand(frequency: 230, gain: 0, bandwidth: 1.0, name: "Low Mid"),
-        EqualizerBand(frequency: 910, gain: 0, bandwidth: 1.0, name: "Mid"),
-        EqualizerBand(frequency: 3600, gain: 0, bandwidth: 1.0, name: "High Mid"),
-        EqualizerBand(frequency: 14000, gain: 0, bandwidth: 1.0, name: "Treble")
+        EqualizerBand(frequency: 150, gain: 0, bandwidth: 1.0, name: "Low Mid"),
+        EqualizerBand(frequency: 400, gain: 0, bandwidth: 1.0, name: "Mid Low"),
+        EqualizerBand(frequency: 1000, gain: 0, bandwidth: 1.0, name: "Mid"),
+        EqualizerBand(frequency: 2400, gain: 0, bandwidth: 1.0, name: "High Mid"),
+        EqualizerBand(frequency: 15000, gain: 0, bandwidth: 1.0, name: "Treble")
     ]
+    
+    // Reverb parameters - enhanced for Hybrid Reverb style
+    @Published var reverbDryWetMix: Float = 0.0  // 0-100%
+    @Published var reverbRoomSize: Float = 0.5   // 0-1
+    @Published var reverbDecayTime: Float = 2.5  // 0.1-10 seconds (increased range)
+    
+    // Reverb state - Enhanced Hybrid Reverb algorithm
+    private var reverbEnabled: Bool = false
+    
+    // Multiple comb filters for early reflections (左右声道各8个，增加密度)
+    private var combBuffersLeft: [[Float]] = []
+    private var combBuffersRight: [[Float]] = []
+    private var combIndicesLeft: [Int] = []
+    private var combIndicesRight: [Int] = []
+    private var combFeedback: Float = 0.84
+    
+    // All-pass filters for diffusion (左右声道各4个，增加扩散)
+    private var allpassBuffersLeft: [[Float]] = []
+    private var allpassBuffersRight: [[Float]] = []
+    private var allpassIndicesLeft: [Int] = []
+    private var allpassIndicesRight: [Int] = []
+    private let allpassFeedback: Float = 0.5
+    
+    // Late reflections (长延迟线模拟尾音)
+    private var lateReverbBufferLeft: [Float] = []
+    private var lateReverbBufferRight: [Float] = []
+    private var lateReverbIndexLeft: Int = 0
+    private var lateReverbIndexRight: Int = 0
+    
+    // Damping filter for high frequency absorption
+    private var dampingLeft: [Float] = []
+    private var dampingRight: [Float] = []
+    private let dampingCoeff: Float = 0.5
+    
+    // Pre-delay for spatial depth
+    private var preDelayBuffer: [Float] = []
+    private var preDelayIndex: Int = 0
+    private let preDelayTime: Int = 882  // 20ms at 44.1kHz
     
     private var filters: [MultiChannelBiquadFilter] = []
     private var sampleRate: Float = 44100.0
@@ -29,9 +68,15 @@ class VideoProcessor: ObservableObject {
     private var videoURL: URL?
     private var timeObserver: Any?
     
+    // DC offset filter for removing low-frequency rumble
+    private var dcFilterLeft: Float = 0.0
+    private var dcFilterRight: Float = 0.0
+    private let dcFilterCoeff: Float = 0.995
+    
     init() {
         setupAudioSession()
         setupFilters()
+        setupReverb()
     }
     
     private func setupAudioSession() {
@@ -50,13 +95,56 @@ class VideoProcessor: ObservableObject {
         updateAllFilters()
     }
     
+    private func setupReverb() {
+        // Enhanced Hybrid Reverb - 增加密度和扩散
+        // Comb filter delays (8个，模拟更密集的早期反射)
+        let combDelaysLeft = [1116, 1188, 1277, 1356, 1422, 1491, 1557, 1617]
+        let combDelaysRight = [1116 + 23, 1188 + 23, 1277 + 23, 1356 + 23, 
+                               1422 + 23, 1491 + 23, 1557 + 23, 1617 + 23]
+        
+        // Allpass filter delays (4个，增加扩散)
+        let allpassDelaysLeft = [556, 441, 341, 225]
+        let allpassDelaysRight = [556 + 23, 441 + 23, 341 + 23, 225 + 23]
+        
+        // Initialize comb filters
+        combBuffersLeft = combDelaysLeft.map { Array(repeating: 0.0, count: $0) }
+        combBuffersRight = combDelaysRight.map { Array(repeating: 0.0, count: $0) }
+        combIndicesLeft = Array(repeating: 0, count: combDelaysLeft.count)
+        combIndicesRight = Array(repeating: 0, count: combDelaysRight.count)
+        
+        // Initialize allpass filters
+        allpassBuffersLeft = allpassDelaysLeft.map { Array(repeating: 0.0, count: $0) }
+        allpassBuffersRight = allpassDelaysRight.map { Array(repeating: 0.0, count: $0) }
+        allpassIndicesLeft = Array(repeating: 0, count: allpassDelaysLeft.count)
+        allpassIndicesRight = Array(repeating: 0, count: allpassDelaysRight.count)
+        
+        // Late reverb buffers (长尾音，模拟大空间)
+        let lateReverbSize = 22050  // 0.5秒 at 44.1kHz
+        lateReverbBufferLeft = Array(repeating: 0.0, count: lateReverbSize)
+        lateReverbBufferRight = Array(repeating: 0.0, count: lateReverbSize)
+        lateReverbIndexLeft = 0
+        lateReverbIndexRight = 0
+        
+        // Damping filters (每个comb一个)
+        dampingLeft = Array(repeating: 0.0, count: combDelaysLeft.count)
+        dampingRight = Array(repeating: 0.0, count: combDelaysRight.count)
+        
+        // Pre-delay buffer
+        preDelayBuffer = Array(repeating: 0.0, count: preDelayTime)
+        preDelayIndex = 0
+        
+        reverbEnabled = false
+    }
+    
     private func updateAllFilters() {
         for (index, band) in equalizerBands.enumerated() {
             if index < filters.count {
+                // Use wider bandwidth (lower Q) for more stable filtering
+                let q = max(0.5, min(1.0 / max(band.bandwidth, 1.5), 3.0))
                 filters[index].setPeakingEQ(
                     frequency: band.frequency,
                     sampleRate: sampleRate,
-                    q: 1.0 / band.bandwidth,
+                    q: q,
                     gainDB: band.gain
                 )
             }
@@ -202,7 +290,7 @@ class VideoProcessor: ObservableObject {
                 let clientInfo = MTAudioProcessingTapGetStorage(tap)
                 
                 let processor = Unmanaged<VideoProcessor>.fromOpaque(clientInfo).takeUnretainedValue()
-                processor.applyEQ(to: bufferListInOut, frameCount: numberFrames)
+                processor.applyAudioEffects(to: bufferListInOut, frameCount: numberFrames)
             }
         )
         
@@ -217,14 +305,14 @@ class VideoProcessor: ObservableObject {
         return status == noErr ? tap?.takeUnretainedValue() : nil
     }
     
-    private func applyEQ(to bufferList: UnsafeMutablePointer<AudioBufferList>, frameCount: CMItemCount) {
+    private func applyAudioEffects(to bufferList: UnsafeMutablePointer<AudioBufferList>, frameCount: CMItemCount) {
         let audioBufferList = UnsafeMutableAudioBufferListPointer(bufferList)
         
         // Check if any EQ is active
         let hasActiveEQ = equalizerBands.contains { abs($0.gain) > 0.1 }
         
-        // If no EQ is active, just pass through
-        if !hasActiveEQ {
+        // If no effects are active, just pass through
+        if !hasActiveEQ && !reverbEnabled {
             return
         }
         
@@ -239,6 +327,7 @@ class VideoProcessor: ObservableObject {
             let count = Int(buffer.mDataByteSize) / MemoryLayout<Float>.size
             let samples = data.bindMemory(to: Float.self, capacity: count)
             
+            // Process each sample
             for i in 0..<count {
                 var sample = samples[i]
                 
@@ -246,17 +335,32 @@ class VideoProcessor: ObservableObject {
                     sample = 0
                 }
                 
-                // Apply all filters in series
-                for filter in filters {
-                    sample = filter.processLeft(sample)
-                    if !sample.isFinite {
-                        sample = 0
-                        break
+                // Apply DC offset filter first
+                dcFilterLeft = dcFilterCoeff * dcFilterLeft + (1.0 - dcFilterCoeff) * sample
+                sample = sample - dcFilterLeft
+                
+                // Apply all filters in series with denormal protection (only if EQ is active)
+                if hasActiveEQ {
+                    for filter in filters {
+                        sample = filter.processLeft(sample)
+                        if !sample.isFinite || abs(sample) < 1e-10 {
+                            sample = 0
+                            break
+                        }
                     }
+                    
+                    // 软削波（tanh）替代硬削波，减少失真
+                    sample = tanhf(sample * 0.9) / 0.9
                 }
                 
-                // Gentle limiting
-                sample = max(-0.95, min(0.95, sample))
+                // Apply reverb if enabled
+                if reverbEnabled && reverbDryWetMix > 0.01 {
+                    sample = applyReverbMono(sample)
+                }
+                
+                // 最终输出削波
+                sample = max(-1.0, min(1.0, sample))
+                
                 samples[i] = sample
             }
         } else if bufferCount >= 2 {
@@ -268,6 +372,7 @@ class VideoProcessor: ObservableObject {
             let leftSamples = leftBuffer.bindMemory(to: Float.self, capacity: count)
             let rightSamples = rightBuffer.bindMemory(to: Float.self, capacity: count)
             
+            // Process each sample
             for i in 0..<count {
                 var leftSample = leftSamples[i]
                 var rightSample = rightSamples[i]
@@ -275,23 +380,175 @@ class VideoProcessor: ObservableObject {
                 if !leftSample.isFinite { leftSample = 0 }
                 if !rightSample.isFinite { rightSample = 0 }
                 
-                // Apply all filters in series
-                for filter in filters {
-                    leftSample = filter.processLeft(leftSample)
-                    rightSample = filter.processRight(rightSample)
+                // Apply DC offset filter first
+                dcFilterLeft = dcFilterCoeff * dcFilterLeft + (1.0 - dcFilterCoeff) * leftSample
+                dcFilterRight = dcFilterCoeff * dcFilterRight + (1.0 - dcFilterCoeff) * rightSample
+                leftSample = leftSample - dcFilterLeft
+                rightSample = rightSample - dcFilterRight
+                
+                // Apply all filters in series with denormal protection (only if EQ is active)
+                if hasActiveEQ {
+                    for filter in filters {
+                        leftSample = filter.processLeft(leftSample)
+                        rightSample = filter.processRight(rightSample)
+                        
+                        if !leftSample.isFinite || abs(leftSample) < 1e-10 { leftSample = 0 }
+                        if !rightSample.isFinite || abs(rightSample) < 1e-10 { rightSample = 0 }
+                    }
                     
-                    if !leftSample.isFinite { leftSample = 0 }
-                    if !rightSample.isFinite { rightSample = 0 }
+                    // 软削波（tanh）替代硬削波，减少失真
+                    leftSample = tanhf(leftSample * 0.9) / 0.9
+                    rightSample = tanhf(rightSample * 0.9) / 0.9
                 }
                 
-                // Gentle limiting
-                leftSample = max(-0.95, min(0.95, leftSample))
-                rightSample = max(-0.95, min(0.95, rightSample))
+                // Apply reverb if enabled
+                if reverbEnabled && reverbDryWetMix > 0.01 {
+                    leftSample = applyReverbStereo(leftSample, isLeft: true)
+                    rightSample = applyReverbStereo(rightSample, isLeft: false)
+                }
+                
+                // 最终输出削波
+                leftSample = max(-1.0, min(1.0, leftSample))
+                rightSample = max(-1.0, min(1.0, rightSample))
                 
                 leftSamples[i] = leftSample
                 rightSamples[i] = rightSample
             }
         }
+    }
+    
+    // Freeverb算法的混响处理
+    private func applyReverbMono(_ input: Float) -> Float {
+        return applyReverbChannel(input, 
+                                  combBuffers: &combBuffersLeft, 
+                                  combIndices: &combIndicesLeft, 
+                                  allpassBuffers: &allpassBuffersLeft, 
+                                  allpassIndices: &allpassIndicesLeft,
+                                  damping: &dampingLeft)
+    }
+    
+    private func applyReverbStereo(_ input: Float, isLeft: Bool) -> Float {
+        if isLeft {
+            return applyReverbChannel(input, 
+                                      combBuffers: &combBuffersLeft, 
+                                      combIndices: &combIndicesLeft, 
+                                      allpassBuffers: &allpassBuffersLeft, 
+                                      allpassIndices: &allpassIndicesLeft,
+                                      damping: &dampingLeft)
+        } else {
+            return applyReverbChannel(input, 
+                                      combBuffers: &combBuffersRight, 
+                                      combIndices: &combIndicesRight, 
+                                      allpassBuffers: &allpassBuffersRight, 
+                                      allpassIndices: &allpassIndicesRight,
+                                      damping: &dampingRight)
+        }
+    }
+    
+    private func applyReverbChannel(_ input: Float, 
+                                    combBuffers: inout [[Float]], 
+                                    combIndices: inout [Int],
+                                    allpassBuffers: inout [[Float]],
+                                    allpassIndices: inout [Int],
+                                    damping: inout [Float]) -> Float {
+        guard reverbEnabled else { return input }
+        
+        // Mix range: UI shows 0-100%, but actual effect is 0-40% (80% of 50%)
+        let wetMix = reverbDryWetMix / 250.0
+        let dryMix = 1.0 - wetMix
+        
+        // Pre-delay for spatial depth (增加空间感)
+        let preDelayedInput = preDelayBuffer[preDelayIndex]
+        preDelayBuffer[preDelayIndex] = input
+        preDelayIndex = (preDelayIndex + 1) % preDelayTime
+        
+        // Enhanced feedback scaling (0.75-0.95 range for longer tail)
+        let roomScaleFeedback = 0.75 + (reverbRoomSize * 0.2)
+        
+        // Decay time affects both feedback and damping
+        // Longer decay = less damping, more feedback
+        let decayScale = min(reverbDecayTime / 10.0, 1.0)
+        let enhancedFeedback = roomScaleFeedback + (decayScale * 0.1)
+        let decayDamping = 1.0 - (decayScale * 0.4)
+        
+        // Process through parallel comb filters (early reflections)
+        var combOutput: Float = 0.0
+        for i in 0..<combBuffers.count {
+            let bufferSize = combBuffers[i].count
+            let readIndex = combIndices[i]
+            
+            // Read delayed sample
+            var delayedSample = combBuffers[i][readIndex]
+            
+            // Apply damping filter (one-pole lowpass) - absorb high frequencies
+            damping[i] = delayedSample * (1.0 - dampingCoeff * decayDamping) + damping[i] * dampingCoeff * decayDamping
+            delayedSample = damping[i]
+            
+            // Feedback with enhanced coefficient for longer tail
+            combBuffers[i][readIndex] = preDelayedInput + delayedSample * min(enhancedFeedback, 0.95)
+            
+            // Accumulate output
+            combOutput += delayedSample
+            
+            // Increment index
+            combIndices[i] = (readIndex + 1) % bufferSize
+        }
+        
+        // Average the comb outputs
+        combOutput /= Float(combBuffers.count)
+        
+        // Process through series allpass filters for diffusion (smoothness)
+        var allpassOutput = combOutput
+        for i in 0..<allpassBuffers.count {
+            let bufferSize = allpassBuffers[i].count
+            let readIndex = allpassIndices[i]
+            
+            let delayedSample = allpassBuffers[i][readIndex]
+            let input_ap = allpassOutput
+            
+            // Allpass formula: output = -input + delayed + (input * feedback)
+            allpassOutput = -input_ap + delayedSample
+            allpassBuffers[i][readIndex] = input_ap + delayedSample * allpassFeedback
+            
+            allpassIndices[i] = (readIndex + 1) % bufferSize
+        }
+        
+        // Mix dry and wet signals with slight boost to wet for more presence
+        let wetGain = wetMix * 1.3  // Boost wet signal
+        return input * dryMix + allpassOutput * wetGain
+    }
+    
+    private func incrementReverbIndex() {
+        // No longer needed with new algorithm
+    }
+    
+    func disableReverb() {
+        reverbEnabled = false
+        // Clear all reverb buffers
+        for i in 0..<combBuffersLeft.count {
+            combBuffersLeft[i] = Array(repeating: 0, count: combBuffersLeft[i].count)
+            combBuffersRight[i] = Array(repeating: 0, count: combBuffersRight[i].count)
+            combIndicesLeft[i] = 0
+            combIndicesRight[i] = 0
+        }
+        for i in 0..<allpassBuffersLeft.count {
+            allpassBuffersLeft[i] = Array(repeating: 0, count: allpassBuffersLeft[i].count)
+            allpassBuffersRight[i] = Array(repeating: 0, count: allpassBuffersRight[i].count)
+            allpassIndicesLeft[i] = 0
+            allpassIndicesRight[i] = 0
+        }
+        dampingLeft = Array(repeating: 0.0, count: dampingLeft.count)
+        dampingRight = Array(repeating: 0.0, count: dampingRight.count)
+        lateReverbBufferLeft = Array(repeating: 0, count: lateReverbBufferLeft.count)
+        lateReverbBufferRight = Array(repeating: 0, count: lateReverbBufferRight.count)
+        lateReverbIndexLeft = 0
+        lateReverbIndexRight = 0
+        preDelayBuffer = Array(repeating: 0, count: preDelayTime)
+        preDelayIndex = 0
+    }
+    
+    func enableReverb() {
+        reverbEnabled = true
     }
     
     private func setupTimeObserver() {
@@ -316,13 +573,14 @@ class VideoProcessor: ObservableObject {
         guard bandIndex < equalizerBands.count else { return }
         equalizerBands[bandIndex].gain = gain
         
-        // Update the specific filter smoothly
+        // Update the specific filter smoothly with wider bandwidth
         if bandIndex < filters.count {
             let band = equalizerBands[bandIndex]
+            let q = max(0.5, min(1.0 / max(band.bandwidth, 1.5), 3.0))
             filters[bandIndex].setPeakingEQ(
                 frequency: band.frequency,
                 sampleRate: sampleRate,
-                q: 1.0 / band.bandwidth,
+                q: q,
                 gainDB: gain
             )
         }
@@ -354,10 +612,17 @@ class VideoProcessor: ObservableObject {
         player?.seek(to: cmTime)
     }
     
-    func reset() {
+    func resetEQ() {
         for i in 0..<equalizerBands.count {
+            equalizerBands[i].gain = 0
             updateEQ(bandIndex: i, gain: 0)
         }
+    }
+    
+    func resetReverb() {
+        reverbDryWetMix = 0.0
+        reverbRoomSize = 0.5
+        reverbDecayTime = 2.5
     }
     
     private func cleanupPlayer() {
