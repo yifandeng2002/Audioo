@@ -315,8 +315,10 @@ class VideoProcessor: ObservableObject {
             &tap
         )
         
-        guard status == noErr, let unmanagedTap = tap else { return nil }
-        return unmanagedTap.takeUnretainedValue()
+        if status == noErr, let tap = tap {
+            return tap.takeUnretainedValue()
+        }
+        return nil
     }
     
     private func resetProcessingState() {
