@@ -307,7 +307,7 @@ class VideoProcessor: ObservableObject {
             }
         )
         
-        var tap: Unmanaged<MTAudioProcessingTap>?
+        var tap: MTAudioProcessingTap?
         let status = MTAudioProcessingTapCreate(
             kCFAllocatorDefault,
             &callbacks,
@@ -315,8 +315,8 @@ class VideoProcessor: ObservableObject {
             &tap
         )
         
-        if status == noErr, let tap = tap {
-            return tap.takeUnretainedValue()
+        if status == noErr {
+            return tap
         }
         return nil
     }
