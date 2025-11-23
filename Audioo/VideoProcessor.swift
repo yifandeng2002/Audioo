@@ -73,6 +73,14 @@ class VideoProcessor: ObservableObject {
     private var dcFilterRight: Float = 0.0
     private let dcFilterCoeff: Float = 0.995
     
+    // Processing state for warmup
+    private var processedFrames: Int = 0
+    private let warmupFrames: Int = 441000  // 10 seconds at 44.1kHz
+    
+    // Thread-safe flags for audio processing thread
+    private var hasActiveEQ: Bool = false
+    private var isReverbActive: Bool = false
+    
     init() {
         setupAudioSession()
         setupFilters()
@@ -279,7 +287,12 @@ class VideoProcessor: ObservableObject {
                 tapStorageOut.pointee = clientInfo
             },
             finalize: { tap in },
-            prepare: { (tap, maxFrames, processingFormat) in },
+            prepare: { (tap, maxFrames, processingFormat) in
+                // Reset all processing state when starting playback/export
+                let clientInfo = MTAudioProcessingTapGetStorage(tap)
+                let processor = Unmanaged<VideoProcessor>.fromOpaque(clientInfo).takeUnretainedValue()
+                processor.resetProcessingState()
+            },
             unprepare: { tap in },
             process: { (tap, numberFrames, flags, bufferListInOut, numberFramesOut, flagsOut) in
                 var timeRange = CMTimeRange()
@@ -294,7 +307,7 @@ class VideoProcessor: ObservableObject {
             }
         )
         
-        var tap: Unmanaged<MTAudioProcessingTap>?
+        var tap: MTAudioProcessingTap?
         let status = MTAudioProcessingTapCreate(
             kCFAllocatorDefault,
             &callbacks,
@@ -302,17 +315,56 @@ class VideoProcessor: ObservableObject {
             &tap
         )
         
-        return status == noErr ? tap?.takeUnretainedValue() : nil
+        return status == noErr ? tap : nil
+    }
+    
+    private func resetProcessingState() {
+        // Reset frame counter
+        processedFrames = 0
+        
+        // Reset DC filters
+        dcFilterLeft = 0.0
+        dcFilterRight = 0.0
+        
+        // Reset all EQ filters
+        for filter in filters {
+            filter.reset()
+        }
+        
+        // Reset reverb buffers if enabled
+        if reverbEnabled {
+            for i in 0..<combBuffersLeft.count {
+                combBuffersLeft[i] = Array(repeating: 0, count: combBuffersLeft[i].count)
+                combBuffersRight[i] = Array(repeating: 0, count: combBuffersRight[i].count)
+                combIndicesLeft[i] = 0
+                combIndicesRight[i] = 0
+            }
+            for i in 0..<allpassBuffersLeft.count {
+                allpassBuffersLeft[i] = Array(repeating: 0, count: allpassBuffersLeft[i].count)
+                allpassBuffersRight[i] = Array(repeating: 0, count: allpassBuffersRight[i].count)
+                allpassIndicesLeft[i] = 0
+                allpassIndicesRight[i] = 0
+            }
+            dampingLeft = Array(repeating: 0.0, count: dampingLeft.count)
+            dampingRight = Array(repeating: 0.0, count: dampingRight.count)
+            lateReverbBufferLeft = Array(repeating: 0, count: lateReverbBufferLeft.count)
+            lateReverbBufferRight = Array(repeating: 0, count: lateReverbBufferRight.count)
+            lateReverbIndexLeft = 0
+            lateReverbIndexRight = 0
+            preDelayBuffer = Array(repeating: 0, count: preDelayTime)
+            preDelayIndex = 0
+        }
     }
     
     private func applyAudioEffects(to bufferList: UnsafeMutablePointer<AudioBufferList>, frameCount: CMItemCount) {
         let audioBufferList = UnsafeMutableAudioBufferListPointer(bufferList)
         
-        // Check if any EQ is active
-        let hasActiveEQ = equalizerBands.contains { abs($0.gain) > 0.1 }
+        // Use thread-safe flags instead of accessing @Published properties
+        let eqActive = hasActiveEQ
+        let reverbActive = isReverbActive
         
         // If no effects are active, just pass through
-        if !hasActiveEQ && !reverbEnabled {
+        if !eqActive && !reverbActive {
             return
         }
         
@@ -331,6 +383,15 @@ class VideoProcessor: ObservableObject {
             for i in 0..<count {
                 var sample = samples[i]
                 
+                // Calculate fade-in factor for warmup period
+                let fadeIn: Float
+                if processedFrames < warmupFrames {
+                    fadeIn = Float(processedFrames) / Float(warmupFrames)
+                    processedFrames += 1
+                } else {
+                    fadeIn = 1.0
+                }
+                
                 if !sample.isFinite {
                     sample = 0
                 }
@@ -348,9 +409,6 @@ class VideoProcessor: ObservableObject {
                             break
                         }
                     }
-                    
-                    // 软削波（tanh）替代硬削波，减少失真
-                    sample = tanhf(sample * 0.9) / 0.9
                 }
                 
                 // Apply reverb if enabled
@@ -358,8 +416,19 @@ class VideoProcessor: ObservableObject {
                     sample = applyReverbMono(sample)
                 }
                 
-                // 最终输出削波
-                sample = max(-1.0, min(1.0, sample))
+                // 温和的软削波（使用tanh，仅当信号较大时）
+                let absSample = abs(sample)
+                if absSample > 0.9 {
+                    // 软削波曲线，保持平滑
+                    let sign = sample > 0 ? Float(1.0) : Float(-1.0)
+                    sample = sign * tanhf(absSample * 0.85)
+                }
+                
+                // 最终安全限制
+                sample = max(-0.98, min(0.98, sample))
+                
+                // Apply fade-in
+                sample *= fadeIn
                 
                 samples[i] = sample
             }
@@ -376,6 +445,15 @@ class VideoProcessor: ObservableObject {
             for i in 0..<count {
                 var leftSample = leftSamples[i]
                 var rightSample = rightSamples[i]
+                
+                // Calculate fade-in factor for warmup period
+                let fadeIn: Float
+                if processedFrames < warmupFrames {
+                    fadeIn = Float(processedFrames) / Float(warmupFrames)
+                    processedFrames += 1
+                } else {
+                    fadeIn = 1.0
+                }
                 
                 if !leftSample.isFinite { leftSample = 0 }
                 if !rightSample.isFinite { rightSample = 0 }
@@ -395,10 +473,6 @@ class VideoProcessor: ObservableObject {
                         if !leftSample.isFinite || abs(leftSample) < 1e-10 { leftSample = 0 }
                         if !rightSample.isFinite || abs(rightSample) < 1e-10 { rightSample = 0 }
                     }
-                    
-                    // 软削波（tanh）替代硬削波，减少失真
-                    leftSample = tanhf(leftSample * 0.9) / 0.9
-                    rightSample = tanhf(rightSample * 0.9) / 0.9
                 }
                 
                 // Apply reverb if enabled
@@ -407,9 +481,26 @@ class VideoProcessor: ObservableObject {
                     rightSample = applyReverbStereo(rightSample, isLeft: false)
                 }
                 
-                // 最终输出削波
-                leftSample = max(-1.0, min(1.0, leftSample))
-                rightSample = max(-1.0, min(1.0, rightSample))
+                // 温和的软削波（使用tanh，仅当信号较大时）
+                let absLeft = abs(leftSample)
+                let absRight = abs(rightSample)
+                
+                if absLeft > 0.9 {
+                    let sign = leftSample > 0 ? Float(1.0) : Float(-1.0)
+                    leftSample = sign * tanhf(absLeft * 0.85)
+                }
+                if absRight > 0.9 {
+                    let sign = rightSample > 0 ? Float(1.0) : Float(-1.0)
+                    rightSample = sign * tanhf(absRight * 0.85)
+                }
+                
+                // 最终安全限制
+                leftSample = max(-0.98, min(0.98, leftSample))
+                rightSample = max(-0.98, min(0.98, rightSample))
+                
+                // Apply fade-in
+                leftSample *= fadeIn
+                rightSample *= fadeIn
                 
                 leftSamples[i] = leftSample
                 rightSamples[i] = rightSample
@@ -513,9 +604,17 @@ class VideoProcessor: ObservableObject {
             allpassIndices[i] = (readIndex + 1) % bufferSize
         }
         
-        // Mix dry and wet signals with slight boost to wet for more presence
-        let wetGain = wetMix * 1.3  // Boost wet signal
-        return input * dryMix + allpassOutput * wetGain
+        // Mix dry and wet signals with controlled wet gain to prevent clipping
+        let wetGain = wetMix * 0.7  // Further reduced to prevent overload
+        let output = input * dryMix + allpassOutput * wetGain
+        
+        // Gentle soft limiting only when necessary
+        let absOutput = abs(output)
+        if absOutput > 0.9 {
+            let sign = output > 0 ? Float(1.0) : Float(-1.0)
+            return sign * tanhf(absOutput * 0.85)
+        }
+        return output
     }
     
     private func incrementReverbIndex() {
@@ -524,6 +623,7 @@ class VideoProcessor: ObservableObject {
     
     func disableReverb() {
         reverbEnabled = false
+        isReverbActive = false
         // Clear all reverb buffers
         for i in 0..<combBuffersLeft.count {
             combBuffersLeft[i] = Array(repeating: 0, count: combBuffersLeft[i].count)
@@ -549,6 +649,7 @@ class VideoProcessor: ObservableObject {
     
     func enableReverb() {
         reverbEnabled = true
+        isReverbActive = true
     }
     
     private func setupTimeObserver() {
@@ -584,6 +685,9 @@ class VideoProcessor: ObservableObject {
                 gainDB: gain
             )
         }
+        
+        // Update thread-safe flag
+        hasActiveEQ = equalizerBands.contains { abs($0.gain) > 0.1 }
     }
     
     func disableEQ() {
@@ -597,6 +701,7 @@ class VideoProcessor: ObservableObject {
                 gainDB: 0  // 禁用时增益为0
             )
         }
+        hasActiveEQ = false
     }
     
     func play() {
@@ -617,6 +722,7 @@ class VideoProcessor: ObservableObject {
             equalizerBands[i].gain = 0
             updateEQ(bandIndex: i, gain: 0)
         }
+        hasActiveEQ = false
     }
     
     func resetReverb() {
