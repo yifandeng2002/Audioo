@@ -21,10 +21,10 @@ class BiquadFilter {
     private var y2: Float = 0.0
     
     func setPeakingEQ(frequency: Float, sampleRate: Float, q: Float, gainDB: Float) {
-        // Clamp parameters to safe ranges with more conservative limits
+        // Clamp parameters to safe ranges with very conservative limits
         let freq = max(20, min(frequency, sampleRate / 2.5))
         let qVal = max(0.5, min(q, 3.0))  // Reduced max Q for stability
-        let gain = max(-18, min(gainDB, 18))  // Reduced gain range
+        let gain = max(-9, min(gainDB, 9))  // Very conservative ±9dB limit
         
         let omega = 2.0 * Float.pi * freq / sampleRate
         let sinOmega = sin(omega)

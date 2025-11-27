@@ -589,33 +589,49 @@ struct ContentView: View {
             exportSession.audioMix = audioMix
         }
         
-        // 监听进度
-        let timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { _ in
-            Task { @MainActor in
-                processingProgress = Double(exportSession.progress)
-            }
-        }
-        
-        // 导出
-        await exportSession.export()
-        timer.invalidate()
-        
-        await MainActor.run {
-            processingProgress = 1.0
-            
-            if exportSession.status == .completed {
-                videoToShare = outputURL
-                showShareSheet = true
-            } else if let error = exportSession.error {
-                print("Export failed: \(error.localizedDescription)")
-            }
-            
-            isProcessing = false
-            
-            // 恢复播放状态
-            if wasPlaying {
-                player.seek(to: currentTime, toleranceBefore: .zero, toleranceAfter: .zero)
-                player.play()
+        // 在后台线程中执行导出，避免阻塞主线程
+        return await withCheckedContinuation { continuation in
+            // 在后台队列中执行导出
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                // 定期更新进度（在后台线程）
+                var progressTimer: DispatchSourceTimer?
+                let queue = DispatchQueue.global(qos: .userInitiated)
+                progressTimer = DispatchSource.makeTimerSource(queue: queue)
+                progressTimer?.setEventHandler { [weak self] in
+                    Task { @MainActor in
+                        self?.processingProgress = Double(exportSession.progress)
+                    }
+                }
+                progressTimer?.schedule(deadline: .now(), repeating: 0.05)  // 更频繁的更新
+                progressTimer?.resume()
+                
+                // 阻塞式导出（在后台线程中不影响UI）
+                exportSession.exportAsynchronously {
+                    progressTimer?.cancel()
+                    
+                    Task { @MainActor [weak self] in
+                        self?.processingProgress = 1.0
+                        
+                        if exportSession.status == .completed {
+                            self?.videoToShare = outputURL
+                            self?.showShareSheet = true
+                        } else if let error = exportSession.error {
+                            print("Export failed: \(error.localizedDescription)")
+                        } else if exportSession.status == .cancelled {
+                            print("Export cancelled")
+                        }
+                        
+                        self?.isProcessing = false
+                        
+                        // 恢复播放状态
+                        if wasPlaying {
+                            player.seek(to: currentTime, toleranceBefore: .zero, toleranceAfter: .zero)
+                            player.play()
+                        }
+                        
+                        continuation.resume()
+                    }
+                }
             }
         }
     }

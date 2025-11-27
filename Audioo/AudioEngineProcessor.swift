@@ -97,6 +97,40 @@ class AudioEngineProcessor {
     func updateBand(index: Int, gain: Float) {
         guard index < eqNode.bands.count else { return }
         eqNode.bands[index].gain = gain
+        
+        // 自动增益补偿，防止削波
+        updateGlobalGain()
+    }
+    
+    /// 计算并应用全局增益补偿，防止 EQ 提升导致削波
+    /// 多频段提升时使用更激进的补偿策略
+    private func updateGlobalGain() {
+        // 计算所有正增益的总和
+        var totalPositiveGain: Float = 0
+        var positiveCount: Int = 0
+        for band in eqNode.bands where !band.bypass {
+            if band.gain > 0 {
+                totalPositiveGain += band.gain
+                positiveCount += 1
+            }
+        }
+        
+        // 应用负的全局增益来补偿
+        // 非常激进的补偿策略（1.2-1.8 系数范围）
+        if totalPositiveGain > 0 {
+            // 根据提升频段数量动态调整补偿系数
+            // 1个频段: 1.2, 2个频段: 1.5, 3+个频段: 1.8
+            var compensationFactor: Float = 1.2
+            if positiveCount >= 3 {
+                compensationFactor = 1.8  // 极度激进的补偿
+            } else if positiveCount == 2 {
+                compensationFactor = 1.5  // 很激进的补偿
+            }
+            
+            eqNode.globalGain = -totalPositiveGain * compensationFactor
+        } else {
+            eqNode.globalGain = 0
+        }
     }
     
     func play() {
@@ -132,5 +166,6 @@ class AudioEngineProcessor {
         for band in eqNode.bands {
             band.gain = 0
         }
+        eqNode.globalGain = 0
     }
 }
