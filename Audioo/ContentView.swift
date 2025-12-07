@@ -23,6 +23,7 @@ struct ShareSheet: UIViewControllerRepresentable {
 
 struct ContentView: View {
     @StateObject private var videoProcessor = VideoProcessor()
+    @StateObject private var projectManager = ProjectManager()
     @State private var selectedItem: PhotosPickerItem?
     @State private var equalizerEnabled = false
     @State private var isProcessing = false
@@ -34,6 +35,10 @@ struct ContentView: View {
     @State private var resetTrigger = false
     @State private var reverbEnabled = false
     @State private var resetReverbTrigger = false
+    @State private var showProjectsList = false
+    @State private var selectedProject: AudioProject?
+    @State private var currentProjectName = ""
+    @State private var showDocumentPicker = false
     
     var body: some View {
         ZStack {
@@ -103,6 +108,10 @@ struct ContentView: View {
             if let videoURL = videoToShare {
                 ShareSheet(items: [videoURL])
             }
+        }
+        .onAppear {
+            // 打印调试信息
+            DebugHelper.printProjectsDirectory()
         }
     }
     
@@ -187,17 +196,50 @@ struct ContentView: View {
                     .stroke(Color.white.opacity(0.1), lineWidth: 1)
             )
         }
+        .contextMenu {
+            Button(action: { showDocumentPicker = true }) {
+                Label("Browse Files", systemImage: "folder")
+            }
+        }
         .onChange(of: selectedItem) { newItem in
             Task {
                 await handleVideoSelection(newItem)
             }
         }
+        .sheet(isPresented: $showDocumentPicker) {
+            DocumentPickerView { url in
+                Task {
+                    print("✅ DocumentPicker URL selected: \(url)")
+                    await handleVideoSelectionFromURL(url)
+                }
+            }
+        }
+        .onAppear {
+            Task {
+                // 预先请求权限
+                await PermissionManager.shared.requestPhotoLibraryPermission()
+            }
+        }
     }
     
     private func handleVideoSelection(_ newItem: PhotosPickerItem?) async {
+        guard let newItem = newItem else {
+            print("❌ handleVideoSelection: newItem is nil")
+            return
+        }
+        
+        print("✅ handleVideoSelection: Starting video selection")
+        
         await MainActor.run {
             isLoadingVideo = true
             loadingProgress = 0
+            print("📊 loadingVideo set to true")
+            // 重置所有效果参数
+            equalizerEnabled = false
+            reverbEnabled = false
+            resetTrigger.toggle()
+            resetReverbTrigger.toggle()
+            print("🔄 UI state reset")
         }
         
         let progressTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { timer in
@@ -208,31 +250,169 @@ struct ContentView: View {
             }
         }
         
-        if let data = try? await newItem?.loadTransferable(type: Data.self) {
-            progressTimer.invalidate()
+        print("📲 Starting to load transferable data...")
+        
+        // 尝试方式 1: 直接加载 Data
+        do {
+            if let data = try await newItem.loadTransferable(type: Data.self) {
+                print("✅ Data loaded successfully via PhotosPicker, size: \(data.count) bytes")
+                await handleLoadedVideoData(data, progressTimer: progressTimer)
+                return
+            }
+        } catch {
+            print("⚠️ Failed to load Data directly: \(error)")
+        }
+        
+        // 尝试方式 2: 加载为 Movie 文件
+        do {
+            if let movieData = try await newItem.loadTransferable(type: Data.self) {
+                print("✅ Movie data loaded successfully, size: \(movieData.count) bytes")
+                await handleLoadedVideoData(movieData, progressTimer: progressTimer)
+                return
+            }
+        } catch {
+            print("⚠️ Failed to load Movie: \(error)")
+        }
+        
+        print("❌ Failed to load video data through all methods")
+        progressTimer.invalidate()
+        await MainActor.run {
+            isLoadingVideo = false
+            selectedItem = nil
+        }
+    }
+    
+    private func handleLoadedVideoData(_ data: Data, progressTimer: Timer) async {
+        progressTimer.invalidate()
+        await MainActor.run {
+            loadingProgress = 0.95
+        }
+        
+        if let tempURL = saveVideoToTempFile(data: data) {
+            print("✅ Video saved to temp file: \(tempURL)")
             await MainActor.run {
-                loadingProgress = 0.95
+                loadingProgress = 1.0
+                print("📹 Loading video in processor...")
+                videoProcessor.loadVideo(from: tempURL)
+                print("✅ Video loaded in processor")
+                
+                // 创建新项目（使用临时 URL，saveProject 会将其复制到永久位置）
+                let newProject = AudioProject(
+                    name: generateProjectName(),
+                    videoURL: tempURL,
+                    equalizerBands: videoProcessor.equalizerBands.map { band in
+                        EqualizerBandData(
+                            frequency: band.frequency,
+                            gain: band.gain,
+                            bandwidth: band.bandwidth,
+                            name: band.name
+                        )
+                    },
+                    reverbDryWetMix: videoProcessor.reverbDryWetMix,
+                    reverbRoomSize: videoProcessor.reverbRoomSize,
+                    reverbDecayTime: videoProcessor.reverbDecayTime,
+                    reverbEnabled: false
+                )
+                selectedProject = newProject
+                currentProjectName = newProject.name
+                projectManager.saveProject(newProject)
+                print("💾 Project created and queued for saving")
+                
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    print("✅ Setting isLoadingVideo to false")
+                    isLoadingVideo = false
+                    // 重置 selectedItem 以便下次可以再次选择
+                    selectedItem = nil
+                    print("✅ selectedItem reset to nil")
+                }
+            }
+        } else {
+            print("❌ Failed to save video to temp file")
+            await MainActor.run {
+                isLoadingVideo = false
+                selectedItem = nil
+            }
+        }
+    }
+    
+    private func handleVideoSelectionFromURL(_ url: URL) async {
+        print("✅ handleVideoSelectionFromURL: Starting with URL \(url)")
+        
+        // 确保访问权限
+        guard url.startAccessingSecurityScopedResource() else {
+            print("❌ Failed to access security scoped resource")
+            return
+        }
+        
+        defer {
+            url.stopAccessingSecurityScopedResource()
+        }
+        
+        do {
+            let data = try Data(contentsOf: url)
+            print("✅ Data loaded from file, size: \(data.count) bytes")
+            
+            await MainActor.run {
+                isLoadingVideo = true
+                loadingProgress = 0
+                equalizerEnabled = false
+                reverbEnabled = false
+                resetTrigger.toggle()
+                resetReverbTrigger.toggle()
             }
             
             if let tempURL = saveVideoToTempFile(data: data) {
+                print("✅ Video saved to temp file: \(tempURL)")
                 await MainActor.run {
                     loadingProgress = 1.0
+                    print("📹 Loading video in processor...")
                     videoProcessor.loadVideo(from: tempURL)
+                    print("✅ Video loaded in processor")
+                    
+                    let newProject = AudioProject(
+                        name: generateProjectName(),
+                        videoURL: tempURL,
+                        equalizerBands: videoProcessor.equalizerBands.map { band in
+                            EqualizerBandData(
+                                frequency: band.frequency,
+                                gain: band.gain,
+                                bandwidth: band.bandwidth,
+                                name: band.name
+                            )
+                        },
+                        reverbDryWetMix: videoProcessor.reverbDryWetMix,
+                        reverbRoomSize: videoProcessor.reverbRoomSize,
+                        reverbDecayTime: videoProcessor.reverbDecayTime,
+                        reverbEnabled: false
+                    )
+                    selectedProject = newProject
+                    currentProjectName = newProject.name
+                    projectManager.saveProject(newProject)
+                    print("💾 Project saved: \(newProject.name)")
+                    
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
                         isLoadingVideo = false
+                        print("✅ isLoadingVideo set to false")
                     }
                 }
             } else {
+                print("❌ Failed to save video to temp file")
                 await MainActor.run {
                     isLoadingVideo = false
                 }
             }
-        } else {
-            progressTimer.invalidate()
+        } catch {
+            print("❌ Error reading file: \(error)")
             await MainActor.run {
                 isLoadingVideo = false
             }
         }
+    }
+    
+    private func generateProjectName() -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "MMM dd, HH:mm"
+        return "Project - \(formatter.string(from: Date()))"
     }
     
     private var audioEffectsModules: some View {
@@ -306,6 +486,7 @@ struct ContentView: View {
                                 onGainChange: { gain in
                                     if equalizerEnabled {
                                         videoProcessor.updateEQ(bandIndex: index, gain: gain)
+                                        updateCurrentProject()
                                     }
                                 }
                             )
@@ -390,7 +571,10 @@ struct ContentView: View {
                             range: 0...100,
                             unit: "%",
                             resetTrigger: $resetReverbTrigger,
-                            enabled: reverbEnabled
+                            enabled: reverbEnabled,
+                            onValueChange: { _ in
+                                updateCurrentProject()
+                            }
                         )
                         
                         // Room Size
@@ -400,7 +584,10 @@ struct ContentView: View {
                             range: 0...1,
                             unit: "",
                             resetTrigger: $resetReverbTrigger,
-                            enabled: reverbEnabled
+                            enabled: reverbEnabled,
+                            onValueChange: { _ in
+                                updateCurrentProject()
+                            }
                         )
                         
                         // Decay Time
@@ -410,7 +597,10 @@ struct ContentView: View {
                             range: 0.1...10,
                             unit: "s",
                             resetTrigger: $resetReverbTrigger,
-                            enabled: reverbEnabled
+                            enabled: reverbEnabled,
+                            onValueChange: { _ in
+                                updateCurrentProject()
+                            }
                         )
                     }
                     .padding(.horizontal, 18)
@@ -453,13 +643,15 @@ struct ContentView: View {
     private var bottomNavigationBar: some View {
         HStack {
             // Projects
-            VStack(spacing: 8) {
-                Image(systemName: "folder")
-                    .font(.system(size: 22))
-                Text("Projects")
-                    .font(.system(size: 11, weight: .medium))
+            Button(action: { showProjectsList = true }) {
+                VStack(spacing: 8) {
+                    Image(systemName: "folder")
+                        .font(.system(size: 22))
+                    Text("Projects")
+                        .font(.system(size: 11, weight: .medium))
+                }
+                .foregroundColor(.gray)
             }
-            .foregroundColor(.gray)
             
             Spacer()
             
@@ -483,6 +675,19 @@ struct ContentView: View {
                         .foregroundColor(.gray)
                 }
             }
+            .contextMenu {
+                Button(action: { showDocumentPicker = true }) {
+                    Label("Browse Files", systemImage: "folder")
+                }
+            }
+            .sheet(isPresented: $showDocumentPicker) {
+                DocumentPickerView { url in
+                    Task {
+                        print("✅ DocumentPicker URL selected from New button: \(url)")
+                        await handleVideoSelectionFromURL(url)
+                    }
+                }
+            }
             
             Spacer()
             
@@ -497,6 +702,14 @@ struct ContentView: View {
         }
         .padding(.horizontal, 44)
         .padding(.bottom, 30)
+        .sheet(isPresented: $showProjectsList) {
+            ProjectsListView(
+                projectManager: projectManager,
+                videoProcessor: videoProcessor,
+                selectedProject: $selectedProject,
+                showProjectsList: $showProjectsList
+            )
+        }
     }
     
     private var overlayViews: some View {
@@ -592,14 +805,14 @@ struct ContentView: View {
         // 在后台线程中执行导出，避免阻塞主线程
         return await withCheckedContinuation { continuation in
             // 在后台队列中执行导出
-            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            DispatchQueue.global(qos: .userInitiated).async {
                 // 定期更新进度（在后台线程）
                 var progressTimer: DispatchSourceTimer?
                 let queue = DispatchQueue.global(qos: .userInitiated)
                 progressTimer = DispatchSource.makeTimerSource(queue: queue)
-                progressTimer?.setEventHandler { [weak self] in
+                progressTimer?.setEventHandler {
                     Task { @MainActor in
-                        self?.processingProgress = Double(exportSession.progress)
+                        self.processingProgress = Double(exportSession.progress)
                     }
                 }
                 progressTimer?.schedule(deadline: .now(), repeating: 0.05)  // 更频繁的更新
@@ -609,19 +822,19 @@ struct ContentView: View {
                 exportSession.exportAsynchronously {
                     progressTimer?.cancel()
                     
-                    Task { @MainActor [weak self] in
-                        self?.processingProgress = 1.0
+                    Task { @MainActor in
+                        self.processingProgress = 1.0
                         
                         if exportSession.status == .completed {
-                            self?.videoToShare = outputURL
-                            self?.showShareSheet = true
+                            self.videoToShare = outputURL
+                            self.showShareSheet = true
                         } else if let error = exportSession.error {
                             print("Export failed: \(error.localizedDescription)")
                         } else if exportSession.status == .cancelled {
                             print("Export cancelled")
                         }
                         
-                        self?.isProcessing = false
+                        self.isProcessing = false
                         
                         // 恢复播放状态
                         if wasPlaying {
@@ -660,6 +873,26 @@ struct ContentView: View {
             print("Error saving video: \(error)")
             return nil
         }
+    }
+    
+    private func updateCurrentProject() {
+        guard var project = selectedProject else { return }
+        
+        project.equalizerBands = videoProcessor.equalizerBands.map { band in
+            EqualizerBandData(
+                frequency: band.frequency,
+                gain: band.gain,
+                bandwidth: band.bandwidth,
+                name: band.name
+            )
+        }
+        project.reverbDryWetMix = videoProcessor.reverbDryWetMix
+        project.reverbRoomSize = videoProcessor.reverbRoomSize
+        project.reverbDecayTime = videoProcessor.reverbDecayTime
+        project.reverbEnabled = reverbEnabled
+        
+        projectManager.saveProject(project)
+        selectedProject = project
     }
 }
 
